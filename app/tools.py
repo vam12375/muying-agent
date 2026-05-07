@@ -4,14 +4,22 @@ from typing import Any
 import httpx
 
 from app.config import settings
+from app.logging_setup import get_logger
 from app.schemas import ToolCallLog
+
+logger = get_logger(__name__)
 
 
 class SpringToolClient:
-    """调用 Spring Boot 电商业务工具的客户端。"""
+    """调用 Spring Boot 电商业务工具的客户端。
 
-    def __init__(self, authorization: str | None):
+    依赖外部传入的 httpx.AsyncClient（由 FastAPI lifespan 管理），
+    避免每次请求新建连接池，提高并发性能。
+    """
+
+    def __init__(self, authorization: str | None, client: httpx.AsyncClient):
         self.authorization = authorization
+        self._client = client
 
     async def search_products(
         self,
@@ -22,13 +30,19 @@ class SpringToolClient:
         risk_level: str,
         keyword: str,
         baby_age_month: int | None,
+        min_price: Any | None = None,
+        max_price: Any | None = None,
         limit: int = 6,
     ) -> dict[str, Any]:
-        payload = {
+        payload: dict[str, Any] = {
             "keyword": keyword,
             "babyAgeMonth": baby_age_month,
             "limit": limit,
         }
+        if min_price is not None:
+            payload["minPrice"] = str(min_price)
+        if max_price is not None:
+            payload["maxPrice"] = str(max_price)
         return await self._call_tool(
             "searchProducts",
             "POST",
@@ -153,25 +167,63 @@ class SpringToolClient:
         started = time.perf_counter()
         request_payload = kwargs.get("json") or kwargs.get("params")
         success = True
-        error_message = None
+        error_message: str | None = None
         response_payload: Any = None
 
         try:
-            async with httpx.AsyncClient(
-                base_url=settings.spring_base_url,
-                timeout=settings.request_timeout_seconds,
+            response = await self._client.request(
+                method,
+                path,
                 headers=self._headers(),
-            ) as client:
-                response = await client.request(method, path, **kwargs)
-                response.raise_for_status()
-                body = response.json()
-                if not body.get("success", False):
-                    raise ValueError(body.get("message", "Spring Boot 工具调用失败"))
-                response_payload = body.get("data")
-                return response_payload
-        except Exception as exc:
+                **kwargs,
+            )
+            response.raise_for_status()
+            body = response.json()
+            if not body.get("success", False):
+                # Spring Boot 业务失败：成功 HTTP 但 body.success=false
+                raise ValueError(body.get("message", "Spring Boot 工具调用失败"))
+            response_payload = body.get("data")
+            return response_payload
+        except httpx.TimeoutException as exc:
+            success = False
+            error_message = f"timeout: {exc}"
+            logger.warning(
+                "工具调用超时 tool=%s trace_id=%s path=%s err=%s",
+                tool_name, trace_id, path, exc,
+            )
+            raise
+        except httpx.HTTPStatusError as exc:
+            success = False
+            error_message = f"http_{exc.response.status_code}: {exc}"
+            logger.warning(
+                "工具返回HTTP错误 tool=%s trace_id=%s status=%s",
+                tool_name, trace_id, exc.response.status_code,
+            )
+            raise
+        except httpx.HTTPError as exc:
+            success = False
+            error_message = f"network: {exc}"
+            logger.warning(
+                "工具网络错误 tool=%s trace_id=%s err=%s",
+                tool_name, trace_id, exc,
+            )
+            raise
+        except ValueError as exc:
+            # 业务约定的失败（success=false），属预期路径，info 级别
             success = False
             error_message = str(exc)
+            logger.info(
+                "工具业务失败 tool=%s trace_id=%s msg=%s",
+                tool_name, trace_id, exc,
+            )
+            raise
+        except Exception as exc:
+            success = False
+            error_message = f"unexpected: {exc}"
+            logger.exception(
+                "工具调用未知异常 tool=%s trace_id=%s",
+                tool_name, trace_id,
+            )
             raise
         finally:
             duration_ms = int((time.perf_counter() - started) * 1000)
@@ -191,19 +243,26 @@ class SpringToolClient:
             )
 
     async def _record_tool_log(self, log: ToolCallLog) -> None:
+        """异步写回工具调用日志。日志写入失败不阻断主流程。"""
         try:
-            async with httpx.AsyncClient(
-                base_url=settings.spring_base_url,
-                timeout=settings.request_timeout_seconds,
+            await self._client.post(
+                "/ai/tools/trace/tool-call",
+                json=log.model_dump(by_alias=False),
                 headers=self._headers(),
-            ) as client:
-                await client.post("/ai/tools/trace/tool-call", json=log.model_dump(by_alias=False))
-        except Exception:
-            # 日志失败不阻断主流程，避免监控链路影响用户回答。
-            return
+            )
+        except Exception as exc:
+            # 链路日志失败不影响用户回答，但要在本地服务侧留痕
+            logger.warning(
+                "写回工具调用日志失败 trace_id=%s tool=%s err=%s",
+                log.traceId, log.toolName, exc,
+            )
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
         if self.authorization:
             headers["Authorization"] = self.authorization
         return headers
+
+
+# 静态访问 settings 以便单测覆盖；实际超时由 lifespan 创建 client 时设置。
+_ = settings
