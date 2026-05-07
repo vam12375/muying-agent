@@ -1,24 +1,58 @@
+import asyncio
+import json
 import uuid
+from collections.abc import AsyncIterator
 from typing import Any
+
+import httpx
 
 from app.intent import AgentIntent, IntentClassifier, RiskLevel
 from app.llm import OptionalLlmClient
+from app.logging_setup import get_logger
 from app.schemas import ChatRequest, ChatResponse
 from app.tools import SpringToolClient
+
+logger = get_logger(__name__)
 
 
 class MuyingAgent:
     """母婴电商业务流程 Agent。"""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        spring_client: httpx.AsyncClient | None = None,
+        llm_client: httpx.AsyncClient | None = None,
+    ) -> None:
         self.classifier = IntentClassifier()
-        self.llm = OptionalLlmClient()
+        self.llm = OptionalLlmClient(client=llm_client)
+        # spring_client 由 lifespan 注入；单测可不传，由调用方提供 SpringToolClient mock
+        self._spring_client = spring_client
 
-    async def chat(self, request: ChatRequest, authorization: str | None) -> ChatResponse:
+    def _build_tools(self, authorization: str | None) -> SpringToolClient:
+        """根据请求级 authorization 构建工具客户端，复用全局连接池。"""
+        if self._spring_client is None:
+            raise RuntimeError(
+                "Spring httpx client 未初始化。请通过 FastAPI lifespan 注入，"
+                "或在测试中直接 mock SpringToolClient。"
+            )
+        return SpringToolClient(authorization, self._spring_client)
+
+    async def chat(
+        self,
+        request: ChatRequest,
+        authorization: str | None,
+        *,
+        polish: bool = True,
+    ) -> ChatResponse:
         trace_id = uuid.uuid4().hex
         intent = self.classifier.classify(request.message)
         risk_level = self.classifier.assess_risk(request.message, intent)
-        tools = SpringToolClient(authorization)
+        tools = self._build_tools(authorization)
+
+        logger.info(
+            "Agent 开始处理 trace_id=%s intent=%s risk=%s conv=%s",
+            trace_id, intent, risk_level, request.conversation_id,
+        )
 
         if intent == AgentIntent.SHOPPING_GUIDE:
             response = await self._handle_shopping(request, tools, trace_id, intent, risk_level)
@@ -40,10 +74,68 @@ class MuyingAgent:
                 suggestions=["推荐8个月宝宝纸尿裤", "查询订单号", "判断订单是否可退款"],
             )
 
-        polished = await self.llm.polish(user_message=request.message, draft_answer=response.answer)
+        if not polish:
+            return response
+
+        polished = await self.llm.polish(
+            user_message=request.message,
+            draft_answer=response.answer,
+            history=request.history,
+            max_chars=request.max_context_chars,
+        )
         if polished:
             response.answer = polished
         return response
+
+    async def chat_stream(
+        self,
+        request: ChatRequest,
+        authorization: str | None,
+    ) -> AsyncIterator[str]:
+        response = await self.chat(request, authorization, polish=False)
+        yield self._sse_event("meta", self._stream_meta(response))
+
+        answer_parts: list[str] = []
+        try:
+            async for chunk in self.llm.stream_polish(
+                user_message=request.message,
+                draft_answer=response.answer,
+                history=request.history,
+                max_chars=request.max_context_chars,
+            ):
+                if not chunk:
+                    continue
+                answer_parts.append(chunk)
+                yield self._sse_event("delta", {"content": chunk})
+        except asyncio.CancelledError:
+            # 客户端断开：不要吞，向上传递让上层正常清理
+            logger.info("流式润色被取消 trace_id=%s", response.trace_id)
+            raise
+        except Exception:
+            # 流式润色失败时回退到业务草稿，避免外部模型异常中断用户主流程。
+            logger.exception("流式润色失败 trace_id=%s", response.trace_id)
+            if not answer_parts:
+                answer_parts.append(response.answer)
+                yield self._sse_event("delta", {"content": response.answer})
+                yield self._sse_event("error", {"message": "大模型流式润色失败，已返回业务草稿。"})
+            else:
+                yield self._sse_event("error", {"message": "大模型流式润色中断，已返回当前生成内容。"})
+
+        if not answer_parts:
+            answer_parts.append(response.answer)
+            yield self._sse_event("delta", {"content": response.answer})
+
+        response.answer = "".join(answer_parts)
+        yield self._sse_event("done", response.model_dump(mode="json", by_alias=True))
+
+    def _stream_meta(self, response: ChatResponse) -> dict[str, Any]:
+        # meta 先发业务上下文，answer 留给 delta/done，前端就能边收边渲染正文。
+        data = response.model_dump(mode="json", by_alias=True)
+        data["answer"] = ""
+        return data
+
+    def _sse_event(self, event: str, data: dict[str, Any]) -> str:
+        return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
     async def _handle_shopping(
         self,
@@ -54,7 +146,13 @@ class MuyingAgent:
         risk_level: str,
     ) -> ChatResponse:
         keyword = self.classifier.extract_keyword(request.message)
-        knowledge = await self._safe_call(
+        baby_age_month = request.baby_age_month
+        if baby_age_month is None:
+            baby_age_month = self.classifier.extract_baby_age_month(request.message)
+        min_price, max_price = self.classifier.extract_price_range(request.message)
+
+        # 知识检索与商品检索互不依赖，并发执行可省一半延迟
+        knowledge_task = self._safe_call(
             tools.search_knowledge(
                 trace_id=trace_id,
                 conversation_id=request.conversation_id,
@@ -64,19 +162,26 @@ class MuyingAgent:
                 limit=3,
             ),
             default=[],
+            tool_name="search_knowledge",
+            trace_id=trace_id,
         )
-        products_page = await self._safe_call(
+        products_task = self._safe_call(
             tools.search_products(
                 trace_id=trace_id,
                 conversation_id=request.conversation_id,
                 intent=intent,
                 risk_level=risk_level,
                 keyword=keyword,
-                baby_age_month=request.baby_age_month,
+                baby_age_month=baby_age_month,
+                min_price=min_price,
+                max_price=max_price,
                 limit=6,
             ),
             default={"records": []},
+            tool_name="search_products",
+            trace_id=trace_id,
         )
+        knowledge, products_page = await asyncio.gather(knowledge_task, products_task)
         products = products_page.get("records", []) if isinstance(products_page, dict) else []
 
         answer = self._format_product_answer(keyword, products, knowledge)
@@ -120,9 +225,14 @@ class MuyingAgent:
                 order_no=order_no,
             ),
             default=None,
+            tool_name="get_order_status",
+            trace_id=trace_id,
         )
         if not order:
-            return self._tool_error_response(request, trace_id, intent, risk_level, "没有查到该订单，或当前账号无权访问。")
+            return self._tool_error_response(
+                request, trace_id, intent, risk_level,
+                "没有查到该订单，或当前账号无权访问。",
+            )
 
         answer = (
             f"订单 {order.get('orderNo')} 当前状态是 {order.get('status')}。"
@@ -170,9 +280,14 @@ class MuyingAgent:
                 reason=request.message,
             ),
             default=None,
+            tool_name="evaluate_refund",
+            trace_id=trace_id,
         )
         if not decision:
-            return self._tool_error_response(request, trace_id, intent, risk_level, "售后规则判断失败，请稍后重试或联系人工客服。")
+            return self._tool_error_response(
+                request, trace_id, intent, risk_level,
+                "售后规则判断失败，请稍后重试或联系人工客服。",
+            )
 
         ticket_id = None
         human_required = bool(decision.get("humanApprovalRequired", True))
@@ -188,10 +303,15 @@ class MuyingAgent:
                     order_id=decision.get("orderId"),
                 ),
                 default=None,
+                tool_name="create_ticket",
+                trace_id=trace_id,
             )
             ticket_id = ticket.get("id") if isinstance(ticket, dict) else None
 
-        answer = f"{decision.get('decision')} 最大可参考退款金额：{decision.get('maxRefundAmount') or '待核验'}。"
+        answer = (
+            f"{decision.get('decision')} 最大可参考退款金额："
+            f"{decision.get('maxRefundAmount') or '待核验'}。"
+        )
         if human_required:
             answer += " 为保证资金和售后安全，AI不会直接退款，需要人工确认。"
 
@@ -225,6 +345,8 @@ class MuyingAgent:
                 content=request.message,
             ),
             default=None,
+            tool_name="create_ticket",
+            trace_id=trace_id,
         )
         ticket_id = ticket.get("id") if isinstance(ticket, dict) else None
         return ChatResponse(
@@ -258,6 +380,8 @@ class MuyingAgent:
                 limit=5,
             ),
             default=[],
+            tool_name="search_knowledge",
+            trace_id=trace_id,
         )
         answer = self._format_knowledge_answer(keyword, knowledge)
         return ChatResponse(
@@ -270,10 +394,24 @@ class MuyingAgent:
             tool_results={"knowledge": knowledge},
         )
 
-    async def _safe_call(self, awaitable: Any, default: Any) -> Any:
+    async def _safe_call(
+        self,
+        awaitable: Any,
+        default: Any,
+        *,
+        tool_name: str = "unknown",
+        trace_id: str = "-",
+    ) -> Any:
+        """统一兜底：保留 CancelledError 上抛，其余异常记录后返回默认值。"""
         try:
             return await awaitable
+        except asyncio.CancelledError:
+            raise
         except Exception:
+            logger.exception(
+                "工具调用失败已降级 tool=%s trace_id=%s default=%r",
+                tool_name, trace_id, default,
+            )
             return default
 
     def _tool_error_response(
@@ -294,11 +432,16 @@ class MuyingAgent:
             suggestions=["稍后重试", "联系人工客服", "返回订单列表"],
         )
 
-    def _format_product_answer(self, keyword: str, products: list[dict[str, Any]], knowledge: list[dict[str, Any]]) -> str:
+    def _format_product_answer(
+        self,
+        keyword: str,
+        products: list[dict[str, Any]],
+        knowledge: list[dict[str, Any]],
+    ) -> str:
         if not products:
-            return f"我没有找到和“{keyword}”直接匹配的商品。可以换一个关键词，或补充宝宝月龄、预算、品牌偏好。"
+            return f"我没有找到和\u201c{keyword}\u201d直接匹配的商品。可以换一个关键词，或补充宝宝月龄、预算、品牌偏好。"
 
-        lines = [f"根据你的需求，我优先筛选了这些商品："]
+        lines = ["根据你的需求，我优先筛选了这些商品："]
         for index, product in enumerate(products[:3], start=1):
             name = product.get("productName") or product.get("name") or "未命名商品"
             price = product.get("priceNew") or product.get("price") or "暂无价格"
@@ -307,13 +450,19 @@ class MuyingAgent:
 
         if knowledge:
             tip = knowledge[0]
-            lines.append(f"相关育儿知识：{tip.get('title') or tip.get('summary') or '建议结合宝宝实际情况选择。'}")
+            lines.append(
+                f"相关育儿知识：{tip.get('title') or tip.get('summary') or '建议结合宝宝实际情况选择。'}"
+            )
         lines.append("涉及湿疹、过敏、用药等问题时，请优先咨询医生，AI只做购物和护理信息辅助。")
         return "\n".join(lines)
 
-    def _format_knowledge_answer(self, keyword: str, knowledge: list[dict[str, Any]]) -> str:
+    def _format_knowledge_answer(
+        self,
+        keyword: str,
+        knowledge: list[dict[str, Any]],
+    ) -> str:
         if not knowledge:
-            return f"暂时没有检索到和“{keyword}”直接相关的育儿知识。你可以换个说法，或补充宝宝月龄和具体症状。"
+            return f"暂时没有检索到和\u201c{keyword}\u201d直接相关的育儿知识。你可以换个说法，或补充宝宝月龄和具体症状。"
 
         lines = ["我从育儿知识库里找到了这些参考信息："]
         for index, tip in enumerate(knowledge[:3], start=1):
