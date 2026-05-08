@@ -5,7 +5,14 @@ import httpx
 
 from app.config import settings
 from app.logging_setup import get_logger
-from app.schemas import ToolCallLog
+from app.schemas import (
+    CreateTicketToolParams,
+    KnowledgeSearchToolParams,
+    OrderStatusToolParams,
+    ProductSearchToolParams,
+    RefundEvaluateToolParams,
+    ToolCallLog,
+)
 
 logger = get_logger(__name__)
 
@@ -34,23 +41,34 @@ class SpringToolClient:
         max_price: Any | None = None,
         limit: int = 6,
     ) -> dict[str, Any]:
+        params = ProductSearchToolParams(
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            intent=intent,
+            risk_level=risk_level,
+            keyword=keyword,
+            baby_age_month=baby_age_month,
+            min_price=min_price,
+            max_price=max_price,
+            limit=limit,
+        )
         payload: dict[str, Any] = {
-            "keyword": keyword,
-            "babyAgeMonth": baby_age_month,
-            "limit": limit,
+            "keyword": params.keyword,
+            "babyAgeMonth": params.baby_age_month,
+            "limit": params.limit,
         }
-        if min_price is not None:
-            payload["minPrice"] = str(min_price)
-        if max_price is not None:
-            payload["maxPrice"] = str(max_price)
+        if params.min_price is not None:
+            payload["minPrice"] = str(params.min_price)
+        if params.max_price is not None:
+            payload["maxPrice"] = str(params.max_price)
         return await self._call_tool(
             "searchProducts",
             "POST",
             "/ai/tools/products/search",
-            trace_id,
-            conversation_id,
-            intent,
-            risk_level,
+            params.trace_id,
+            params.conversation_id,
+            params.intent,
+            params.risk_level,
             json=payload,
         )
 
@@ -64,15 +82,24 @@ class SpringToolClient:
         keyword: str,
         limit: int = 5,
     ) -> list[dict[str, Any]]:
+        params = KnowledgeSearchToolParams(
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            intent=intent,
+            risk_level=risk_level,
+            keyword=keyword,
+            limit=limit,
+        )
         data = await self._call_tool(
             "searchKnowledgeBase",
             "GET",
             "/ai/tools/knowledge/search",
-            trace_id,
-            conversation_id,
-            intent,
-            risk_level,
-            params={"keyword": keyword, "limit": limit},
+            params.trace_id,
+            params.conversation_id,
+            params.intent,
+            params.risk_level,
+            params={"keyword": params.keyword, "limit": params.limit},
+            tool_type="RAG",
         )
         return data or []
 
@@ -86,15 +113,23 @@ class SpringToolClient:
         order_id: int | None,
         order_no: str | None,
     ) -> dict[str, Any]:
-        payload = {"orderId": order_id, "orderNo": order_no}
+        params = OrderStatusToolParams(
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            intent=intent,
+            risk_level=risk_level,
+            order_id=order_id,
+            order_no=order_no,
+        )
+        payload = {"orderId": params.order_id, "orderNo": params.order_no}
         return await self._call_tool(
             "getOrderStatus",
             "POST",
             "/ai/tools/orders/status",
-            trace_id,
-            conversation_id,
-            intent,
-            risk_level,
+            params.trace_id,
+            params.conversation_id,
+            params.intent,
+            params.risk_level,
             json=payload,
         )
 
@@ -109,15 +144,24 @@ class SpringToolClient:
         order_no: str | None,
         reason: str,
     ) -> dict[str, Any]:
-        payload = {"orderId": order_id, "orderNo": order_no, "reason": reason}
+        params = RefundEvaluateToolParams(
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            intent=intent,
+            risk_level=risk_level,
+            order_id=order_id,
+            order_no=order_no,
+            reason=reason,
+        )
+        payload = {"orderId": params.order_id, "orderNo": params.order_no, "reason": params.reason}
         return await self._call_tool(
             "evaluateRefund",
             "POST",
             "/ai/tools/refunds/evaluate",
-            trace_id,
-            conversation_id,
-            intent,
-            risk_level,
+            params.trace_id,
+            params.conversation_id,
+            params.intent,
+            params.risk_level,
             json=payload,
         )
 
@@ -133,23 +177,33 @@ class SpringToolClient:
         order_id: int | None = None,
         product_id: int | None = None,
     ) -> dict[str, Any]:
+        params = CreateTicketToolParams(
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            intent=intent,
+            risk_level=risk_level,
+            title=title,
+            content=content,
+            order_id=order_id,
+            product_id=product_id,
+        )
         payload = {
-            "conversationId": conversation_id,
-            "orderId": order_id,
-            "productId": product_id,
-            "title": title,
-            "content": content,
-            "intent": intent,
-            "riskLevel": risk_level,
+            "conversationId": params.conversation_id,
+            "orderId": params.order_id,
+            "productId": params.product_id,
+            "title": params.title,
+            "content": params.content,
+            "intent": params.intent,
+            "riskLevel": params.risk_level,
         }
         return await self._call_tool(
             "createSupportTicket",
             "POST",
             "/ai/tools/tickets",
-            trace_id,
-            conversation_id,
-            intent,
-            risk_level,
+            params.trace_id,
+            params.conversation_id,
+            params.intent,
+            params.risk_level,
             json=payload,
         )
 
@@ -162,6 +216,7 @@ class SpringToolClient:
         conversation_id: int | None,
         intent: str,
         risk_level: str,
+        tool_type: str = "BUSINESS_API",
         **kwargs: Any,
     ) -> Any:
         started = time.perf_counter()
@@ -169,53 +224,71 @@ class SpringToolClient:
         success = True
         error_message: str | None = None
         response_payload: Any = None
+        max_attempts = max(1, settings.tool_max_retries + 1)
 
         try:
-            response = await self._client.request(
-                method,
-                path,
-                headers=self._headers(),
-                **kwargs,
-            )
-            response.raise_for_status()
-            body = response.json()
-            if not body.get("success", False):
-                # Spring Boot 业务失败：成功 HTTP 但 body.success=false
-                raise ValueError(body.get("message", "Spring Boot 工具调用失败"))
-            response_payload = body.get("data")
-            return response_payload
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    response = await self._client.request(
+                        method,
+                        path,
+                        headers=self._headers(),
+                        timeout=settings.tool_timeout_seconds,
+                        **kwargs,
+                    )
+                    response.raise_for_status()
+                    body = response.json()
+                    if not body.get("success", False):
+                        # Spring Boot 业务失败：成功 HTTP 但 body.success=false
+                        raise ValueError(body.get("message", "Spring Boot 工具调用失败"))
+                    success = True
+                    error_message = None
+                    response_payload = body.get("data")
+                    return response_payload
+                except httpx.TimeoutException as exc:
+                    success = False
+                    error_message = f"timeout: {exc}"
+                    logger.warning(
+                        "工具调用超时 tool=%s trace_id=%s path=%s attempt=%d/%d err=%s",
+                        tool_name, trace_id, path, attempt, max_attempts, exc,
+                    )
+                    if attempt < max_attempts:
+                        continue
+                    raise
+                except httpx.HTTPStatusError as exc:
+                    success = False
+                    error_message = f"http_{exc.response.status_code}: {exc}"
+                    logger.warning(
+                        "工具返回HTTP错误 tool=%s trace_id=%s status=%s",
+                        tool_name, trace_id, exc.response.status_code,
+                    )
+                    raise
+                except httpx.HTTPError as exc:
+                    success = False
+                    error_message = f"network: {exc}"
+                    logger.warning(
+                        "工具网络错误 tool=%s trace_id=%s attempt=%d/%d err=%s",
+                        tool_name, trace_id, attempt, max_attempts, exc,
+                    )
+                    if attempt < max_attempts:
+                        continue
+                    raise
+                except ValueError as exc:
+                    # 业务约定的失败（success=false），属预期路径，info 级别
+                    success = False
+                    error_message = str(exc)
+                    logger.info(
+                        "工具业务失败 tool=%s trace_id=%s msg=%s",
+                        tool_name, trace_id, exc,
+                    )
+                    raise
         except httpx.TimeoutException as exc:
-            success = False
-            error_message = f"timeout: {exc}"
-            logger.warning(
-                "工具调用超时 tool=%s trace_id=%s path=%s err=%s",
-                tool_name, trace_id, path, exc,
-            )
             raise
         except httpx.HTTPStatusError as exc:
-            success = False
-            error_message = f"http_{exc.response.status_code}: {exc}"
-            logger.warning(
-                "工具返回HTTP错误 tool=%s trace_id=%s status=%s",
-                tool_name, trace_id, exc.response.status_code,
-            )
             raise
         except httpx.HTTPError as exc:
-            success = False
-            error_message = f"network: {exc}"
-            logger.warning(
-                "工具网络错误 tool=%s trace_id=%s err=%s",
-                tool_name, trace_id, exc,
-            )
             raise
-        except ValueError as exc:
-            # 业务约定的失败（success=false），属预期路径，info 级别
-            success = False
-            error_message = str(exc)
-            logger.info(
-                "工具业务失败 tool=%s trace_id=%s msg=%s",
-                tool_name, trace_id, exc,
-            )
+        except ValueError:
             raise
         except Exception as exc:
             success = False
@@ -234,6 +307,7 @@ class SpringToolClient:
                     intent=intent,
                     riskLevel=risk_level,
                     toolName=tool_name,
+                    toolType=tool_type,
                     requestPayload=request_payload,
                     responsePayload=response_payload,
                     success=success,
