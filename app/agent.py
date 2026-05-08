@@ -1,18 +1,38 @@
 import asyncio
 import json
+import time
 import uuid
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, Protocol
 
 import httpx
 
 from app.intent import AgentIntent, IntentClassifier, RiskLevel
 from app.llm import OptionalLlmClient
 from app.logging_setup import get_logger
+from app.rag import RetrievalBundle, build_retrieval_bundle
 from app.schemas import ChatRequest, ChatResponse
 from app.tools import SpringToolClient
+from app.workflow import WorkflowStep, completed_workflow
 
 logger = get_logger(__name__)
+
+# SSE 流式输出内置心跳间隔（秒）
+# 选 25s 是因为：常见反向代理（nginx、cloudflare）默认 60s 空闲超时，
+# 25s 给上下游各留一次包袱；OpenAI 兼容代理通常每 ~3s 推一个 token，
+# 心跳只在 LLM 出现长间隙（>25s）时才会触发，正常聊天不冗余。
+SSE_HEARTBEAT_SECONDS = 25.0
+
+
+class _DisconnectProbe(Protocol):
+    """流式过程中用于检测客户端是否已断开的协议。
+
+    抽象出 Protocol 而非直接绑定 starlette.Request，方便：
+    - 单测里传一个永远 False 的 stub；
+    - 将来切到 ASGI 原生接口或自研监听。
+    """
+
+    async def is_disconnected(self) -> bool: ...
 
 
 class MuyingAgent:
@@ -72,6 +92,12 @@ class MuyingAgent:
                 intent=AgentIntent.UNKNOWN,
                 risk_level=RiskLevel.LOW,
                 suggestions=["推荐8个月宝宝纸尿裤", "查询订单号", "判断订单是否可退款"],
+                workflow=self._workflow(
+                    trace_id,
+                    AgentIntent.UNKNOWN,
+                    RiskLevel.LOW,
+                    [WorkflowStep.CLASSIFY, WorkflowStep.RISK_GATE, WorkflowStep.RESPOND],
+                ),
             )
 
         if not polish:
@@ -91,48 +117,123 @@ class MuyingAgent:
         self,
         request: ChatRequest,
         authorization: str | None,
+        *,
+        disconnect_probe: _DisconnectProbe | None = None,
     ) -> AsyncIterator[str]:
+        """SSE 流式聊天。
+
+        事件协议：
+        - meta：业务上下文（trace_id / intent / suggestions 等），answer 留空
+        - delta：增量 token 文本片段（content 字段）
+        - ping：心跳事件，每 SSE_HEARTBEAT_SECONDS 秒注入一次，
+                防止反向代理空闲超时切断；前端可忽略
+        - error：流式润色失败时的错误说明
+        - done：会话终结，data 含完整 ChatResponse + status 字段
+                * status="success"   正常完成
+                * status="error"     LLM 流式失败但已回退草稿
+                * status="cancelled" 客户端断开导致提前终止
+        """
         response = await self.chat(request, authorization, polish=False)
         yield self._sse_event("meta", self._stream_meta(response))
 
+        # 状态机：done 事件最终携带的 status
+        final_status = "success"
         answer_parts: list[str] = []
+
         try:
-            async for chunk in self.llm.stream_polish(
+            stream_iter = self.llm.stream_polish(
                 user_message=request.message,
                 draft_answer=response.answer,
                 history=request.history,
                 max_chars=request.max_context_chars,
-            ):
+            ).__aiter__()
+
+            while True:
+                # 用 wait_for 控制空闲：超时即心跳；客户端断开即提前退出
+                try:
+                    chunk = await asyncio.wait_for(
+                        stream_iter.__anext__(),
+                        timeout=SSE_HEARTBEAT_SECONDS,
+                    )
+                except StopAsyncIteration:
+                    # LLM 正常结束
+                    break
+                except asyncio.TimeoutError:
+                    # 空闲超过心跳间隔：先看客户端是否已经走了，再决定是发心跳还是终止
+                    if await self._client_disconnected(disconnect_probe):
+                        final_status = "cancelled"
+                        logger.info("流式期间客户端已断开 trace_id=%s", response.trace_id)
+                        break
+                    yield self._sse_event("ping", {"ts": int(time.time())})
+                    continue
+
                 if not chunk:
                     continue
                 answer_parts.append(chunk)
                 yield self._sse_event("delta", {"content": chunk})
+
+                # 正常 token 到达后也顺带做一次断开检测；不阻塞主路径
+                if await self._client_disconnected(disconnect_probe):
+                    final_status = "cancelled"
+                    logger.info("流式期间客户端已断开 trace_id=%s", response.trace_id)
+                    break
+
         except asyncio.CancelledError:
-            # 客户端断开：不要吞，向上传递让上层正常清理
+            # 协程被取消（FastAPI 在客户端断开时会触发）：标记并上抛
             logger.info("流式润色被取消 trace_id=%s", response.trace_id)
+            final_status = "cancelled"
             raise
         except Exception:
-            # 流式润色失败时回退到业务草稿，避免外部模型异常中断用户主流程。
+            # 流式润色失败时回退到业务草稿，避免外部模型异常中断用户主流程
             logger.exception("流式润色失败 trace_id=%s", response.trace_id)
+            final_status = "error"
             if not answer_parts:
                 answer_parts.append(response.answer)
                 yield self._sse_event("delta", {"content": response.answer})
-                yield self._sse_event("error", {"message": "大模型流式润色失败，已返回业务草稿。"})
+                yield self._sse_event(
+                    "error",
+                    {"status": "error", "message": "大模型流式润色失败，已返回业务草稿。"},
+                )
             else:
-                yield self._sse_event("error", {"message": "大模型流式润色中断，已返回当前生成内容。"})
+                yield self._sse_event(
+                    "error",
+                    {"status": "error", "message": "大模型流式润色中断，已返回当前生成内容。"},
+                )
 
-        if not answer_parts:
+        # 客户端取消时不再补 delta（用户已离开），其它情况下保证至少一条文本
+        if not answer_parts and final_status != "cancelled":
             answer_parts.append(response.answer)
             yield self._sse_event("delta", {"content": response.answer})
 
-        response.answer = "".join(answer_parts)
-        yield self._sse_event("done", response.model_dump(mode="json", by_alias=True))
+        response.answer = "".join(answer_parts) or response.answer
+        yield self._sse_event("done", self._build_done_payload(response, final_status))
+
+    async def _client_disconnected(self, probe: _DisconnectProbe | None) -> bool:
+        """探测客户端是否已断开。失败时静默返回 False，避免单次探测错误中断流。"""
+        if probe is None:
+            return False
+        try:
+            return await probe.is_disconnected()
+        except Exception:
+            return False
 
     def _stream_meta(self, response: ChatResponse) -> dict[str, Any]:
-        # meta 先发业务上下文，answer 留给 delta/done，前端就能边收边渲染正文。
+        # meta 先发业务上下文，answer 留给 delta/done，前端可边收边渲染正文
         data = response.model_dump(mode="json", by_alias=True)
         data["answer"] = ""
         return data
+
+    def _build_done_payload(self, response: ChatResponse, status: str) -> dict[str, Any]:
+        """done 事件负载：完整响应 + 终态 status。
+
+        前端通过 status 区分：
+        - success：可以保存对话；
+        - error：仍可保存（已含兜底文本），可加错误提示；
+        - cancelled：用户已离开，可不保存或仅本地保存。
+        """
+        payload = response.model_dump(mode="json", by_alias=True)
+        payload["status"] = status
+        return payload
 
     def _sse_event(self, event: str, data: dict[str, Any]) -> str:
         return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
@@ -184,7 +285,11 @@ class MuyingAgent:
         knowledge, products_page = await asyncio.gather(knowledge_task, products_task)
         products = products_page.get("records", []) if isinstance(products_page, dict) else []
 
-        answer = self._format_product_answer(keyword, products, knowledge)
+        retrieval = build_retrieval_bundle(query=keyword, knowledge=knowledge, products=products)
+        answer = self._append_sources(
+            self._format_product_answer(keyword, products, knowledge),
+            retrieval,
+        )
         return ChatResponse(
             conversation_id=request.conversation_id,
             trace_id=trace_id,
@@ -192,7 +297,24 @@ class MuyingAgent:
             intent=intent,
             risk_level=risk_level,
             suggestions=["查看商品详情", "加入购物车", "继续按预算筛选"],
-            tool_results={"products": products, "knowledge": knowledge},
+            tool_results={
+                "products": products,
+                "knowledge": knowledge,
+                "sources": retrieval.to_tool_result(),
+            },
+            workflow=self._workflow(
+                trace_id,
+                intent,
+                risk_level,
+                [
+                    WorkflowStep.CLASSIFY,
+                    WorkflowStep.RISK_GATE,
+                    WorkflowStep.SELECT_TOOL,
+                    WorkflowStep.RETRIEVE,
+                    WorkflowStep.CALL_TOOL,
+                    WorkflowStep.RESPOND,
+                ],
+            ),
         )
 
     async def _handle_order(
@@ -213,6 +335,12 @@ class MuyingAgent:
                 intent=intent,
                 risk_level=risk_level,
                 suggestions=["去订单列表查看", "输入：订单号 2026xxxx", "联系人工客服"],
+                workflow=self._workflow(
+                    trace_id,
+                    intent,
+                    risk_level,
+                    [WorkflowStep.CLASSIFY, WorkflowStep.RISK_GATE, WorkflowStep.RESPOND],
+                ),
             )
 
         order = await self._safe_call(
@@ -247,6 +375,18 @@ class MuyingAgent:
             risk_level=risk_level,
             suggestions=["查看物流详情", "判断是否可退款", "联系人工客服"],
             tool_results={"order": order},
+            workflow=self._workflow(
+                trace_id,
+                intent,
+                risk_level,
+                [
+                    WorkflowStep.CLASSIFY,
+                    WorkflowStep.RISK_GATE,
+                    WorkflowStep.SELECT_TOOL,
+                    WorkflowStep.CALL_TOOL,
+                    WorkflowStep.RESPOND,
+                ],
+            ),
         )
 
     async def _handle_refund(
@@ -267,6 +407,12 @@ class MuyingAgent:
                 intent=intent,
                 risk_level=risk_level,
                 suggestions=["去订单列表查看", "输入订单号", "转人工客服"],
+                workflow=self._workflow(
+                    trace_id,
+                    intent,
+                    risk_level,
+                    [WorkflowStep.CLASSIFY, WorkflowStep.RISK_GATE, WorkflowStep.RESPOND],
+                ),
             )
 
         decision = await self._safe_call(
@@ -325,6 +471,19 @@ class MuyingAgent:
             ticket_id=ticket_id,
             suggestions=["提交售后申请", "上传凭证", "联系人工客服"],
             tool_results={"refundDecision": decision},
+            workflow=self._workflow(
+                trace_id,
+                intent,
+                decision.get("riskLevel", risk_level),
+                [
+                    WorkflowStep.CLASSIFY,
+                    WorkflowStep.RISK_GATE,
+                    WorkflowStep.SELECT_TOOL,
+                    WorkflowStep.CALL_TOOL,
+                    *([WorkflowStep.HUMAN_HANDOFF] if human_required else []),
+                    WorkflowStep.RESPOND,
+                ],
+            ),
         )
 
     async def _handle_complaint(
@@ -359,6 +518,19 @@ class MuyingAgent:
             ticket_id=ticket_id,
             suggestions=["补充订单号", "上传凭证图片", "等待客服处理"],
             tool_results={"ticket": ticket},
+            workflow=self._workflow(
+                trace_id,
+                intent,
+                RiskLevel.HIGH,
+                [
+                    WorkflowStep.CLASSIFY,
+                    WorkflowStep.RISK_GATE,
+                    WorkflowStep.SELECT_TOOL,
+                    WorkflowStep.HUMAN_HANDOFF,
+                    WorkflowStep.CALL_TOOL,
+                    WorkflowStep.RESPOND,
+                ],
+            ),
         )
 
     async def _handle_knowledge(
@@ -383,7 +555,8 @@ class MuyingAgent:
             tool_name="search_knowledge",
             trace_id=trace_id,
         )
-        answer = self._format_knowledge_answer(keyword, knowledge)
+        retrieval = build_retrieval_bundle(query=keyword, knowledge=knowledge, products=[])
+        answer = self._append_sources(self._format_knowledge_answer(keyword, knowledge), retrieval)
         return ChatResponse(
             conversation_id=request.conversation_id,
             trace_id=trace_id,
@@ -391,7 +564,20 @@ class MuyingAgent:
             intent=intent,
             risk_level=risk_level,
             suggestions=["查看育儿知识详情", "继续提问", "按月龄推荐商品"],
-            tool_results={"knowledge": knowledge},
+            tool_results={"knowledge": knowledge, "sources": retrieval.to_tool_result()},
+            workflow=self._workflow(
+                trace_id,
+                intent,
+                risk_level,
+                [
+                    WorkflowStep.CLASSIFY,
+                    WorkflowStep.RISK_GATE,
+                    WorkflowStep.SELECT_TOOL,
+                    WorkflowStep.RETRIEVE,
+                    WorkflowStep.CALL_TOOL,
+                    WorkflowStep.RESPOND,
+                ],
+            ),
         )
 
     async def _safe_call(
@@ -430,6 +616,39 @@ class MuyingAgent:
             risk_level=risk_level,
             human_handoff_required=True,
             suggestions=["稍后重试", "联系人工客服", "返回订单列表"],
+            workflow=self._workflow(
+                trace_id,
+                intent,
+                risk_level,
+                [
+                    WorkflowStep.CLASSIFY,
+                    WorkflowStep.RISK_GATE,
+                    WorkflowStep.SELECT_TOOL,
+                    WorkflowStep.FALLBACK,
+                    WorkflowStep.RESPOND,
+                ],
+            ),
+        )
+
+    def _append_sources(self, answer: str, retrieval: RetrievalBundle) -> str:
+        """在最终草稿中保留依据来源，降低 RAG/LLM 编造风险。"""
+        suffix = retrieval.format_answer_suffix()
+        if not suffix:
+            return answer
+        return f"{answer}{suffix}"
+
+    def _workflow(
+        self,
+        trace_id: str,
+        intent: str,
+        risk_level: str,
+        steps: list[str],
+    ) -> dict[str, Any]:
+        return completed_workflow(
+            trace_id=trace_id,
+            intent=intent,
+            risk_level=risk_level,
+            steps=steps,
         )
 
     def _format_product_answer(
