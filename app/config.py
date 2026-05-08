@@ -13,6 +13,10 @@ class Settings(BaseSettings):
     spring_base_url: str = "http://localhost:8080/api"
     # 调用 Spring Boot 与大模型接口的超时时间（秒）
     request_timeout_seconds: int = 30
+    # 单个业务工具调用的超时时间（秒），比全局请求超时更短，便于快速降级。
+    tool_timeout_seconds: float = 8.0
+    # 工具失败重试次数；只重试超时/网络错误，不重试业务拒绝和 4xx/5xx。
+    tool_max_retries: int = 1
 
     # ===== 大模型 =====
     # 是否启用大模型润色；关闭时仅使用业务草稿，便于本地演示
@@ -31,6 +35,9 @@ class Settings(BaseSettings):
     # 内网共享密钥；非空时所有 /api/v1/* 请求必须带 X-Internal-Token 头。
     # 留空表示不开启（仅推荐本地调试场景）。
     internal_token: str = ""
+    # 聊天接口限流上限（slowapi 表达式，例 "60/minute"、"5/second"）。
+    # 维度：per-IP；多实例部署需共享速率时改用 Redis 后端。
+    chat_rate_limit: str = "60/minute"
 
     # ===== 上下文裁剪 =====
     # 历史消息总字符上限；超过则从最早的开始丢弃。
