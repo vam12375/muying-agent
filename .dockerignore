@@ -1,0 +1,43 @@
+# Git 元数据
+.git
+.gitignore
+.gitattributes
+
+# 虚拟环境（容器内会自己装）
+.venv
+venv
+env
+
+# Python 字节码与缓存
+__pycache__
+*.py[cod]
+*.egg-info
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+
+# IDE / 编辑器
+.idea
+.vscode
+*.swp
+.DS_Store
+Thumbs.db
+
+# 文档与测试不进运行时镜像（保持 image 小且最小依赖面）
+docs
+tests
+README.md
+*.md
+!requirements.txt
+
+# 环境变量与本地配置（密钥绝不能进镜像层）
+.env
+.env.*
+!.env.example
+
+# 容器化产物自身
+Dockerfile
+.dockerignore
+docker-compose*.yml

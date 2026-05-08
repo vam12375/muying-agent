@@ -1,0 +1,28 @@
+# 本地一键起 muying-agent 的开发示例
+# 生产部署建议直接用 K8s manifest，把 livez/readyz 探针写进 deployment
+version: "3.9"
+
+services:
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: muying-agent
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    # 把本地 .env 当配置注入；密钥与 INTERNAL_TOKEN 不写进镜像
+    env_file:
+      - .env
+    environment:
+      # 用 host.docker.internal 让容器回连宿主机的 muying-mall
+      MUYING_AGENT_SPRING_BASE_URL: http://host.docker.internal:8080/api
+      MUYING_AGENT_LOG_LEVEL: INFO
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8001/livez', timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
